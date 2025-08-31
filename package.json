@@ -1,0 +1,22 @@
+{
+  "name": "secure-scrubber",
+  "version": "1.3.0",
+  "description": "An interactive tool to securely wipe user-space data and scan for drives.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "secure",
+    "wipe",
+    "cli",
+    "drive",
+    "scan"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "inquirer": "^8.2.4"
+  }
+}
