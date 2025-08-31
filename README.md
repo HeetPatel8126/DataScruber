@@ -27,7 +27,7 @@ Python (v3.6+)
 ## 🚀 Getting Started
 Clone the code:
 
-git clone [https://github.com/your-username/data-scrubber.git]
+git clone (https://github.com/HeetPatel8126/DataScruber.git)<br>
 cd data-scrubber
 
 Install dependencies:
@@ -45,3 +45,4 @@ On Linux/macOS: First, make the script executable (chmod +x start.sh), then run 
 🛡️ Secure Wipe (Recommended): Overwrites all data once. Defeats all software recovery tools.<br>
 
 💀 Paranoid Wipe (Very Slow): Overwrites files three times. For maximum security.
+
