@@ -76,6 +76,8 @@ const getDrives = () => {
 const startWipeProcess = (targetPath, mode) => {
     console.log(chalk.blue('\nStarting Python wiping engine. This may take a very long time...'));
     console.log(chalk.red.bold('Press CTRL+C at any time to safely cancel the process.\n'));
+    console.log(chalk.yellow('Note: System files and protected directories will be automatically skipped.'));
+    console.log(chalk.yellow('If you see permission errors, try running as Administrator/sudo.\n'));
     console.log(chalk.gray('You will see live progress updates from the engine below.\n'));
 
     const pythonExecutable = process.platform === 'win32' ? 'python' : 'python3';
