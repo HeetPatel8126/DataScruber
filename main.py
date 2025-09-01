@@ -24,6 +24,65 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # --- Helper Functions ---
 
+def is_system_directory(dir_path):
+    """Check if a directory is a system directory that should be skipped."""
+    system_dirs = [
+        # Windows system directories
+        'System Volume Information',
+        '$RECYCLE.BIN',
+        'Recovery',
+        'Windows',
+        'Program Files',
+        'Program Files (x86)',
+        'ProgramData',
+        'Users',
+        'hiberfil.sys',
+        'pagefile.sys',
+        'swapfile.sys',
+        # Linux system directories
+        '.Trash',
+        'lost+found',
+        'proc',
+        'sys',
+        'dev',
+        'boot',
+        'etc',
+        'lib',
+        'lib64',
+        'sbin',
+        'bin',
+        'usr',
+        'var',
+        'tmp',
+        'opt',
+        'run',
+        'mnt',
+        'media',
+        # Mounted Windows drives in Linux commonly have these
+        '$RECYCLE.BIN',
+        'System Volume Information'
+    ]
+    
+    dir_name = os.path.basename(dir_path)
+    
+    # Check for exact matches (case-insensitive)
+    for sys_dir in system_dirs:
+        if dir_name.lower() == sys_dir.lower():
+            return True
+    
+    # Check for Windows system file patterns
+    if dir_name.lower().startswith('$'):  # Windows system files often start with $
+        return True
+        
+    # Check if it's a hidden system directory (starts with .)
+    if dir_name.startswith('.') and len(dir_name) > 1:
+        # Allow common user directories like .config, .local but skip system ones
+        allowed_user_dirs = ['.config', '.local', '.cache', '.ssh', '.gnupg']
+        if dir_name.lower() not in allowed_user_dirs:
+            return True
+    
+    return False
+
 def status_update(msg_type, message):
     """Sends a simple status message to the Node.js frontend."""
     print(json.dumps({"type": msg_type, "message": message}), flush=True)
@@ -56,12 +115,38 @@ def phase_0_calculate_work(target_path, passes):
     
     # Calculate size of all files to be overwritten
     for root, dirs, files in os.walk(target_path):
+        # Skip system directories that typically require elevated permissions
+        # This modifies dirs in-place to prevent os.walk from descending into them
+        original_dirs = dirs[:]
+        dirs[:] = [d for d in dirs if not is_system_directory(os.path.join(root, d))]
+        
+        # Log skipped directories for user awareness
+        skipped_dirs = set(original_dirs) - set(dirs)
+        for skipped_dir in skipped_dirs:
+            status_update("status", f"Skipping system directory: {os.path.join(root, skipped_dir)}")
+        
         for file in files:
             file_path = os.path.join(root, file)
             try:
-                total_bytes += os.path.getsize(file_path)
-                file_paths.append(file_path)
-            except OSError:
+                # Skip hidden system files on Windows drives
+                file_name = os.path.basename(file_path)
+                if file_name.lower() in ['hiberfil.sys', 'pagefile.sys', 'swapfile.sys']:
+                    status_update("status", f"Skipping Windows system file: {file_path}")
+                    continue
+                
+                # Check if we can access the file before adding it
+                if os.access(file_path, os.R_OK | os.W_OK):
+                    file_size = os.path.getsize(file_path)
+                    # Skip zero-byte files or files we can't read size of
+                    if file_size > 0:
+                        total_bytes += file_size
+                        file_paths.append(file_path)
+                    else:
+                        status_update("status", f"Skipping empty/special file: {file_path}")
+                else:
+                    status_update("status", f"Skipping protected file: {file_path}")
+            except (OSError, PermissionError) as e:
+                status_update("status", f"Skipping inaccessible file: {file_path} - {e}")
                 pass # Ignore files we can't access
     
     total_bytes *= passes
@@ -79,6 +164,11 @@ def phase_0_calculate_work(target_path, passes):
 def overwrite_and_report(file_path, passes, start_time, total_work, processed_bytes, speed_tracker):
     """Overwrites a single file and reports progress."""
     try:
+        # Check permissions before attempting to open
+        if not os.access(file_path, os.R_OK | os.W_OK):
+            status_update("status", f"Skipping protected file: {file_path}")
+            return processed_bytes
+            
         file_size = os.path.getsize(file_path)
         with open(file_path, 'rb+') as f:
             for i in range(passes):
@@ -148,7 +238,7 @@ def overwrite_and_report(file_path, passes, start_time, total_work, processed_by
                         }
                         print(json.dumps(progress_data), flush=True)
 
-    except (IOError, OSError) as e:
+    except (IOError, OSError, PermissionError) as e:
         status_update("status", f"Warning: Could not overwrite {file_path}. Reason: {e}")
     
     return processed_bytes
@@ -228,6 +318,35 @@ def main():
     parser.add_argument('-m', '--mode', required=True, choices=['quick', 'secure', 'paranoid'], help="The wiping mode.")
     args = parser.parse_args()
 
+    # Check if we have basic access to the target path
+    if not os.path.exists(args.path):
+        status_update("error", f"Target path does not exist: {args.path}")
+        sys.exit(1)
+    
+    if not os.access(args.path, os.R_OK):
+        status_update("error", f"No read permission for target path: {args.path}")
+        if os.name == 'posix':  # Linux/Unix
+            status_update("status", "Try running with sudo: sudo python3 main.py ...")
+            if args.path.startswith('/mnt/') or args.path.startswith('/media/'):
+                status_update("status", "For mounted drives, you may need to remount with user permissions")
+        else:  # Windows
+            status_update("status", "Try running as Administrator")
+        sys.exit(1)
+    
+    # Additional check for mounted drives on Linux
+    if os.name == 'posix' and (args.path.startswith('/mnt/') or args.path.startswith('/media/')):
+        try:
+            # Try to create a test file to verify write permissions
+            test_file = os.path.join(args.path, '.permission_test_temp')
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+        except (OSError, PermissionError):
+            status_update("error", f"No write permission for mounted drive: {args.path}")
+            status_update("status", "Mounted Windows drives may require special mount options for write access")
+            status_update("status", "Try: sudo mount -o remount,uid=$(id -u),gid=$(id -g) {mount_point}")
+            sys.exit(1)
+
     junk_files_created = []
 
     try:
@@ -235,9 +354,40 @@ def main():
             # Quick mode does not get an ETA as it's just deleting files.
             status_update("status", "Mode: Quick Wipe (File Deletion Only)")
             # Re-implement quick delete logic here for simplicity
+            files_deleted = 0
+            dirs_deleted = 0
+            errors_encountered = 0
+            
             for root, dirs, files in os.walk(args.path, topdown=False):
-                for name in files: os.remove(os.path.join(root, name))
-                for name in dirs: os.rmdir(os.path.join(root, name))
+                # Skip system directories
+                dirs[:] = [d for d in dirs if not is_system_directory(os.path.join(root, d))]
+                
+                for name in files:
+                    file_path = os.path.join(root, name)
+                    try:
+                        if os.access(file_path, os.W_OK):
+                            os.remove(file_path)
+                            files_deleted += 1
+                        else:
+                            status_update("status", f"Skipping protected file: {file_path}")
+                            errors_encountered += 1
+                    except (OSError, PermissionError) as e:
+                        status_update("status", f"Could not delete file {file_path}: {e}")
+                        errors_encountered += 1
+                
+                for name in dirs:
+                    dir_path = os.path.join(root, name)
+                    try:
+                        if os.access(dir_path, os.W_OK):
+                            os.rmdir(dir_path)
+                            dirs_deleted += 1
+                    except (OSError, PermissionError) as e:
+                        status_update("status", f"Could not delete directory {dir_path}: {e}")
+                        errors_encountered += 1
+            
+            status_update("status", f"Quick wipe completed: {files_deleted} files and {dirs_deleted} directories deleted")
+            if errors_encountered > 0:
+                status_update("status", f"Note: {errors_encountered} items could not be deleted due to permissions")
 
         else: # secure or paranoid
             passes = 3 if args.mode == 'paranoid' else 1
@@ -279,6 +429,15 @@ def main():
         else:
             status_update("status", "All operations completed.")
 
+    except PermissionError as e:
+        status_update("error", f"Permission denied: {e}")
+        status_update("status", "This typically happens when trying to access system files.")
+        status_update("status", "Try running with elevated permissions or choose a different target path.")
+        # Still try to clean up
+        for f in junk_files_created:
+            try: os.remove(f)
+            except OSError: pass
+        sys.exit(1)
     except Exception as e:
         status_update("error", f"An unexpected error occurred: {e}")
         # Still try to clean up
