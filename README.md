@@ -36,7 +36,7 @@ Install dependencies:
 npm install
 
 ## ▶️ How to Run
-On Windows: Double-click start.bat or run ```.\start.bat``` in your terminal.
+On Windows: Double-click ```start.bat``` file  or run ```.\start.bat``` in your terminal.
 
 On Linux: In terminal go to the folder where the DataScruber folder is stored by using ```cd folder_name``` then same thing again ```cd DataScruber```.<br>
 
@@ -48,6 +48,7 @@ then use the command ```node index.js``` make sure you have node.js installed wi
 🛡️ Secure Wipe (Recommended): Overwrites all data once. Defeats all software recovery tools.<br>
 
 💀 Paranoid Wipe (Very Slow): Overwrites files three times. For maximum security.
+
 
 
 
