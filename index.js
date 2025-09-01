@@ -96,7 +96,29 @@ const startWipeProcess = (targetPath, mode) => {
 
     pythonProcess.stdout.on('data', (data) => {
         const message = data.toString().trim();
-        if (message) console.log(chalk.green(`[ENGINE] `) + `${message}`);
+        if (message) {
+            try {
+                // Try to parse as JSON first (for progress updates)
+                const jsonData = JSON.parse(message);
+                
+                if (jsonData.type === 'progress') {
+                    // Display formatted progress bar
+                    const progressBar = '█'.repeat(Math.floor(jsonData.percentage / 2)) + 
+                                       '░'.repeat(50 - Math.floor(jsonData.percentage / 2));
+                    console.log(chalk.blue(`[${jsonData.phase}] `) + 
+                               chalk.cyan(`${progressBar} `) + 
+                               chalk.yellow(`${jsonData.percentage}% `) +
+                               chalk.gray(`(${jsonData.speed}, ETA: ${jsonData.eta})`));
+                } else if (jsonData.type === 'status') {
+                    console.log(chalk.green(`[ENGINE] `) + `${jsonData.message}`);
+                } else if (jsonData.type === 'error') {
+                    console.error(chalk.red(`[ENGINE_ERROR] `) + `${jsonData.message}`);
+                }
+            } catch (e) {
+                // Not JSON, display as regular message
+                console.log(chalk.green(`[ENGINE] `) + `${message}`);
+            }
+        }
     });
 
     pythonProcess.stderr.on('data', (data) => {
