@@ -76,7 +76,7 @@ def phase_0_calculate_work(target_path, passes):
     return total_bytes, file_paths
 
 
-def overwrite_and_report(file_path, passes, start_time, total_work, processed_bytes):
+def overwrite_and_report(file_path, passes, start_time, total_work, processed_bytes, speed_tracker):
     """Overwrites a single file and reports progress."""
     try:
         file_size = os.path.getsize(file_path)
@@ -92,32 +92,68 @@ def overwrite_and_report(file_path, passes, start_time, total_work, processed_by
                     if is_cancelled: return processed_bytes
                     
                     bytes_to_write = min(chunk_size, remaining_bytes)
-                    f.write(secrets.token_bytes(bytes_to_write))
+                    
+                    # Pre-generate random data to exclude generation time from write speed
+                    random_data = secrets.token_bytes(bytes_to_write)
+                    
+                    # Measure only actual write operation time
+                    chunk_start_time = time.perf_counter()  # More precise than time.time()
+                    f.write(random_data)
+                    f.flush()  # Force write to disk (bypass OS buffers)
+                    chunk_duration = time.perf_counter() - chunk_start_time
+                    
                     remaining_bytes -= bytes_to_write
                     processed_bytes += bytes_to_write
                     
-                    # --- Progress Calculation & Reporting ---
+                    # --- Improved Progress Calculation & Reporting ---
                     elapsed_time = time.time() - start_time
-                    speed_bps = processed_bytes / elapsed_time if elapsed_time > 0 else 0
-                    remaining_work = total_work - processed_bytes
-                    eta = remaining_work / speed_bps if speed_bps > 0 else float('inf')
+                    
+                    # Update speed tracker with recent chunk performance
+                    if chunk_duration > 0.001:  # Ignore very fast chunks (likely cached)
+                        current_speed = bytes_to_write / chunk_duration
+                        speed_tracker.append(current_speed)
+                        # Keep only last 20 speed measurements for better smoothing
+                        if len(speed_tracker) > 20:
+                            speed_tracker.pop(0)
+                    
+                    # Calculate smoothed speed (average of recent measurements)
+                    if len(speed_tracker) >= 5 and elapsed_time > 3:  # Need at least 5 samples and 3 seconds
+                        # Use median instead of average to filter out outliers
+                        sorted_speeds = sorted(speed_tracker)
+                        mid = len(sorted_speeds) // 2
+                        if len(sorted_speeds) % 2 == 0:
+                            smoothed_speed = (sorted_speeds[mid-1] + sorted_speeds[mid]) / 2
+                        else:
+                            smoothed_speed = sorted_speeds[mid]
+                        
+                        remaining_work = total_work - processed_bytes
+                        eta = remaining_work / smoothed_speed if smoothed_speed > 0 else float('inf')
+                        eta_display = format_eta(eta) if eta != float('inf') else "Calculating..."
+                    else:
+                        # Fallback to total average for initial period
+                        smoothed_speed = processed_bytes / elapsed_time if elapsed_time > 0 else 0
+                        eta_display = "Calculating..."
+                    
                     percentage = (processed_bytes / total_work) * 100 if total_work > 0 else 100
                     
-                    progress_data = {
-                        "type": "progress",
-                        "phase": f"Overwrite (Pass {i+1}/{passes})",
-                        "percentage": round(percentage, 2),
-                        "speed": f"{format_size(speed_bps)}/s",
-                        "eta": format_eta(eta)
-                    }
-                    print(json.dumps(progress_data), flush=True)
+                    # Only report progress every 5MB or every 5 seconds to reduce spam
+                    if (processed_bytes % (5 * 1024 * 1024) < bytes_to_write) or (time.time() - getattr(overwrite_and_report, 'last_report_time', 0) > 5):
+                        overwrite_and_report.last_report_time = time.time()
+                        progress_data = {
+                            "type": "progress",
+                            "phase": f"Overwrite (Pass {i+1}/{passes})",
+                            "percentage": round(percentage, 2),
+                            "speed": f"{format_size(smoothed_speed)}/s",
+                            "eta": eta_display
+                        }
+                        print(json.dumps(progress_data), flush=True)
 
     except (IOError, OSError) as e:
         status_update("status", f"Warning: Could not overwrite {file_path}. Reason: {e}")
     
     return processed_bytes
 
-def fill_free_space_and_report(target_path, start_time, total_work, processed_bytes):
+def fill_free_space_and_report(target_path, start_time, total_work, processed_bytes, speed_tracker):
     """Fills free space and reports progress."""
     junk_file_paths = []
     try:
@@ -125,28 +161,62 @@ def fill_free_space_and_report(target_path, start_time, total_work, processed_by
         while not is_cancelled:
             junk_file_path = os.path.join(target_path, f'junk_fill_{count}.tmp')
             junk_file_paths.append(junk_file_path)
-            with open(junk_file_path, 'wb') as f:
+            
+            try:
                 chunk_size = 1024 * 1024 * 32 # 32MB chunks
-                f.write(secrets.token_bytes(chunk_size))
+                # Pre-generate random data
+                random_data = secrets.token_bytes(chunk_size)
+                
+                # Measure only actual write operation time
+                chunk_start_time = time.perf_counter()
+                with open(junk_file_path, 'wb') as f:
+                    f.write(random_data)
+                    f.flush()  # Force write to disk
+                chunk_duration = time.perf_counter() - chunk_start_time
                 processed_bytes += chunk_size
 
-                # --- Progress Calculation & Reporting ---
+                # --- Improved Progress Calculation & Reporting ---
                 elapsed_time = time.time() - start_time
-                speed_bps = processed_bytes / elapsed_time if elapsed_time > 0 else 0
-                remaining_work = total_work - processed_bytes
-                # ETA for filling can be inaccurate as we don't know the exact end point
-                eta = remaining_work / speed_bps if speed_bps > 0 else float('inf') 
-                percentage = (processed_bytes / total_work) * 100 if total_work > 0 else 100
                 
-                progress_data = {
-                    "type": "progress",
-                    "phase": "Fill Free Space",
-                    "percentage": round(min(percentage, 99.9), 2), # Don't show 100% until it's really done
-                    "speed": f"{format_size(speed_bps)}/s",
-                    "eta": format_eta(eta) if eta != float('inf') else "Calculating..."
-                }
-                print(json.dumps(progress_data), flush=True)
-            count += 1
+                # Update speed tracker (only for meaningful measurements)
+                if chunk_duration > 0.01:  # Ignore very fast chunks (likely cached)
+                    current_speed = chunk_size / chunk_duration
+                    speed_tracker.append(current_speed)
+                    if len(speed_tracker) > 20:
+                        speed_tracker.pop(0)
+                
+                # For free space filling, we can't know exact endpoint, so be conservative
+                if len(speed_tracker) >= 5 and elapsed_time > 5:  # Need sufficient samples
+                    # Use median for more stable speed measurement
+                    sorted_speeds = sorted(speed_tracker)
+                    mid = len(sorted_speeds) // 2
+                    if len(sorted_speeds) % 2 == 0:
+                        smoothed_speed = (sorted_speeds[mid-1] + sorted_speeds[mid]) / 2
+                    else:
+                        smoothed_speed = sorted_speeds[mid]
+                    eta_display = "Unknown (filling until full)"
+                else:
+                    smoothed_speed = processed_bytes / elapsed_time if elapsed_time > 0 else 0
+                    eta_display = "Calculating..."
+                
+                # Cap percentage to prevent going over 100%
+                percentage = min((processed_bytes / total_work) * 100 if total_work > 0 else 100, 99.9)
+                
+                # Report progress less frequently to reduce spam
+                if count % 5 == 0 or (time.time() - getattr(fill_free_space_and_report, 'last_report_time', 0) > 3):
+                    fill_free_space_and_report.last_report_time = time.time()
+                    progress_data = {
+                        "type": "progress",
+                        "phase": "Fill Free Space",
+                        "percentage": round(percentage, 2),
+                        "speed": f"{format_size(smoothed_speed)}/s",
+                        "eta": eta_display
+                    }
+                    print(json.dumps(progress_data), flush=True)
+                count += 1
+            except (IOError, OSError):
+                # Disk is likely full, break the loop
+                break
     except (IOError, OSError):
         status_update("status", "Disk space is full. Stopping junk file creation.")
     
@@ -175,11 +245,12 @@ def main():
             
             processed_bytes = 0
             start_time = time.time()
+            speed_tracker = []  # Track recent speed measurements for smoothing
 
             # --- Phase 1: Overwrite ---
             for file_path in file_paths:
                 if is_cancelled: break
-                processed_bytes = overwrite_and_report(file_path, passes, start_time, total_work, processed_bytes)
+                processed_bytes = overwrite_and_report(file_path, passes, start_time, total_work, processed_bytes, speed_tracker)
             
             # --- Phase 2: Delete ---
             if not is_cancelled:
@@ -195,7 +266,7 @@ def main():
 
             # --- Phase 3: Fill Free Space ---
             if not is_cancelled:
-                junk_files_created = fill_free_space_and_report(args.path, start_time, total_work, processed_bytes)
+                junk_files_created = fill_free_space_and_report(args.path, start_time, total_work, processed_bytes, speed_tracker)
         
         # --- Phase 4: Cleanup ---
         status_update("status", "Cleaning up temporary files...")
