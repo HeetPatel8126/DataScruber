@@ -1,599 +1,655 @@
 import os
 import sys
 import argparse
-import secrets
 import signal
 import time
 import json
+import subprocess
 import shutil
-import stat
 
-# --- Signal Handling for Graceful Cancellation ---
+# --- Platform-Specific Imports ---
+# Ctypes are only used for low-level Windows API calls
+if os.name == 'nt':
+    import ctypes
+    from ctypes import wintypes
+
+# --- Global State for Graceful Cancellation ---
 is_cancelled = False
 
 def signal_handler(signum, frame):
-    """Sets the cancellation flag when a signal is received."""
+    """Sets the cancellation flag when a SIGTERM or SIGINT is received."""
     global is_cancelled
     if not is_cancelled:
-        # We send a JSON message so the Node.js frontend can display it cleanly
-        status_update("status", "Cancellation signal received. Cleaning up...")
+        status_update("status", "Cancellation signal received. Attempting to stop gracefully...")
         is_cancelled = True
 
+# Register signal handlers for graceful shutdown
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 
-# --- Helper Functions ---
-
-def is_system_directory(dir_path):
-    """Check if a directory is a system directory that should be skipped."""
-    system_dirs = [
-        # Windows system directories
-        'System Volume Information',
-        '$RECYCLE.BIN',
-        'Recovery',
-        'Windows',
-        'Program Files',
-        'Program Files (x86)',
-        'ProgramData',
-        'Users',
-        'hiberfil.sys',
-        'pagefile.sys',
-        'swapfile.sys',
-        # Linux system directories
-        '.Trash',
-        'lost+found',
-        'proc',
-        'sys',
-        'dev',
-        'boot',
-        'etc',
-        'lib',
-        'lib64',
-        'sbin',
-        'bin',
-        'usr',
-        'var',
-        'tmp',
-        'opt',
-        'run',
-        'mnt',
-        'media',
-        # Mounted Windows drives in Linux commonly have these
-        '$RECYCLE.BIN',
-        'System Volume Information'
-    ]
-    
-    dir_name = os.path.basename(dir_path)
-    
-    # Check for exact matches (case-insensitive)
-    for sys_dir in system_dirs:
-        if dir_name.lower() == sys_dir.lower():
-            return True
-    
-    # Check for Windows system file patterns
-    if dir_name.lower().startswith('$'):  # Windows system files often start with $
-        return True
-        
-    # Check if it's a hidden system directory (starts with .)
-    if dir_name.startswith('.') and len(dir_name) > 1:
-        # Allow common user directories like .config, .local but skip system ones
-        allowed_user_dirs = ['.config', '.local', '.cache', '.ssh', '.gnupg']
-        if dir_name.lower() not in allowed_user_dirs:
-            return True
-    
-    return False
-
-def status_update(msg_type, message):
-    """Sends a simple status message to the Node.js frontend."""
-    print(json.dumps({"type": msg_type, "message": message}), flush=True)
-
-def format_eta(seconds):
-    """Formats seconds into a HH:MM:SS string."""
-    if seconds is None or seconds < 0:
-        return "--:--:--"
-    return time.strftime('%H:%M:%S', time.gmtime(seconds))
-
-def format_size(byte_count):
-    """Formats bytes into a human-readable string (KB, MB, GB)."""
-    if byte_count is None: return "0 B"
-    power = 1024
-    n = 0
-    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while byte_count >= power and n < len(power_labels) -1 :
-        byte_count /= power
-        n += 1
-    return f"{byte_count:.2f} {power_labels[n]}B"
-
-
-# --- Deletion Helpers ---
-
-def make_writable(path: str):
-    """Best-effort: make a file/dir writable so it can be deleted (Windows + POSIX)."""
+# --- Privilege & Input Validation Helpers ---
+def is_admin_windows():
+    """Check for administrator privileges on Windows."""
+    if os.name != 'nt':
+        return False
     try:
-        mode = os.stat(path).st_mode
-        os.chmod(path, mode | stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception:
-        pass
+        return False
 
-def final_sweep_delete_everything(target_path: str):
-    """Best-effort pass to remove any remaining files and then empty directories.
-    Returns (files_deleted, dirs_deleted).
-    """
-    files_deleted_total = 0
-    dirs_deleted_total = 0
-
-    # Try multiple passes to catch directories that become empty after earlier deletions
-    for _ in range(3):
-        files_deleted_this_pass = 0
-        dirs_deleted_this_pass = 0
-
-        for root, dirs, files in os.walk(target_path, topdown=False):
-            # Delete any lingering files first
-            for name in files:
-                fpath = os.path.join(root, name)
-                try:
-                    make_writable(fpath)
-                    os.remove(fpath)
-                    files_deleted_this_pass += 1
-                except Exception:
-                    continue
-
-            # Then try to delete directories
-            for d in dirs:
-                dpath = os.path.join(root, d)
-                try:
-                    # Make writable and attempt removal if empty
-                    make_writable(dpath)
-                    os.rmdir(dpath)
-                    dirs_deleted_this_pass += 1
-                except Exception:
-                    continue
-
-        files_deleted_total += files_deleted_this_pass
-        dirs_deleted_total += dirs_deleted_this_pass
-
-        if files_deleted_this_pass == 0 and dirs_deleted_this_pass == 0:
-            break
-
-    return files_deleted_total, dirs_deleted_total
-
-
-# --- Core Wiping Logic ---
-
-def phase_0_calculate_work(target_path, passes):
-    """Phase 0: Calculate the total amount of data to be written."""
-    status_update("status", "Calculating total work size...")
-    total_bytes = 0
-    file_paths = []
-    
-    # Calculate size of all files to be overwritten
-    for root, dirs, files in os.walk(target_path):
-        # Skip system directories that typically require elevated permissions
-        # This modifies dirs in-place to prevent os.walk from descending into them
-        original_dirs = dirs[:]
-        dirs[:] = [d for d in dirs if not is_system_directory(os.path.join(root, d))]
-        
-        # Log skipped directories for user awareness
-        skipped_dirs = set(original_dirs) - set(dirs)
-        for skipped_dir in skipped_dirs:
-            status_update("status", f"Skipping system directory: {os.path.join(root, skipped_dir)}")
-        
-        for file in files:
-            file_path = os.path.join(root, file)
-            try:
-                # Skip hidden system files on Windows drives
-                file_name = os.path.basename(file_path)
-                if file_name.lower() in ['hiberfil.sys', 'pagefile.sys', 'swapfile.sys']:
-                    status_update("status", f"Skipping Windows system file: {file_path}")
-                    continue
-                
-                # Check if we can access the file before adding it
-                if os.access(file_path, os.R_OK | os.W_OK):
-                    file_size = os.path.getsize(file_path)
-                    # Skip zero-byte files or files we can't read size of
-                    if file_size > 0:
-                        total_bytes += file_size
-                        file_paths.append(file_path)
-                    else:
-                        status_update("status", f"Skipping empty/special file: {file_path}")
-                else:
-                    status_update("status", f"Skipping protected file: {file_path}")
-            except (OSError, PermissionError) as e:
-                status_update("status", f"Skipping inaccessible file: {file_path} - {e}")
-                pass # Ignore files we can't access
-    
-    total_bytes *= passes
-
-    # Add free space for secure/paranoid modes
+def is_root_linux():
+    """Check for root privileges on Linux/POSIX systems."""
     try:
-        _, _, free = shutil.disk_usage(target_path)
-        total_bytes += free
-    except OSError as e:
-        status_update("status", f"Warning: Could not get free space. ETA may be inaccurate. Reason: {e}")
+        return os.geteuid() == 0
+    except AttributeError:
+        # This will be raised on non-POSIX systems like Windows
+        return False
 
-    return total_bytes, file_paths
-
-
-def overwrite_and_report(file_path, passes, start_time, total_work, processed_bytes, speed_tracker):
-    """Overwrites a single file and reports progress."""
-    try:
-        # Check permissions before attempting to open
-        if not os.access(file_path, os.R_OK | os.W_OK):
-            status_update("status", f"Skipping protected file: {file_path}")
-            return processed_bytes
-            
-        file_size = os.path.getsize(file_path)
-        with open(file_path, 'rb+') as f:
-            for i in range(passes):
-                if is_cancelled: return processed_bytes
-                
-                f.seek(0)
-                chunk_size = 1024 * 1024 # 1MB chunks
-                remaining_bytes = file_size
-                
-                while remaining_bytes > 0:
-                    if is_cancelled: return processed_bytes
-                    
-                    bytes_to_write = min(chunk_size, remaining_bytes)
-                    
-                    # Pre-generate random data to exclude generation time from write speed
-                    random_data = secrets.token_bytes(bytes_to_write)
-                    
-                    # Measure only actual write operation time
-                    chunk_start_time = time.perf_counter()  # More precise than time.time()
-                    f.write(random_data)
-                    f.flush()  # Force write to disk (bypass OS buffers)
-                    chunk_duration = time.perf_counter() - chunk_start_time
-                    
-                    remaining_bytes -= bytes_to_write
-                    processed_bytes += bytes_to_write
-                    
-                    # --- Improved Progress Calculation & Reporting ---
-                    elapsed_time = time.time() - start_time
-                    
-                    # Update speed tracker with recent chunk performance
-                    if chunk_duration > 0.001:  # Ignore very fast chunks (likely cached)
-                        current_speed = bytes_to_write / chunk_duration
-                        speed_tracker.append(current_speed)
-                        # Keep only last 20 speed measurements for better smoothing
-                        if len(speed_tracker) > 20:
-                            speed_tracker.pop(0)
-                    
-                    # Calculate smoothed speed (average of recent measurements)
-                    if len(speed_tracker) >= 5 and elapsed_time > 3:  # Need at least 5 samples and 3 seconds
-                        # Use median instead of average to filter out outliers
-                        sorted_speeds = sorted(speed_tracker)
-                        mid = len(sorted_speeds) // 2
-                        if len(sorted_speeds) % 2 == 0:
-                            smoothed_speed = (sorted_speeds[mid-1] + sorted_speeds[mid]) / 2
-                        else:
-                            smoothed_speed = sorted_speeds[mid]
-                        
-                        remaining_work = total_work - processed_bytes
-                        eta = remaining_work / smoothed_speed if smoothed_speed > 0 else float('inf')
-                        eta_display = format_eta(eta) if eta != float('inf') else "Calculating..."
-                    else:
-                        # Fallback to total average for initial period
-                        smoothed_speed = processed_bytes / elapsed_time if elapsed_time > 0 else 0
-                        eta_display = "Calculating..."
-                    
-                    percentage = (processed_bytes / total_work) * 100 if total_work > 0 else 100
-                    
-                    # Only report progress every 5MB or every 5 seconds to reduce spam
-                    if (processed_bytes % (5 * 1024 * 1024) < bytes_to_write) or (time.time() - getattr(overwrite_and_report, 'last_report_time', 0) > 5):
-                        overwrite_and_report.last_report_time = time.time()
-                        progress_data = {
-                            "type": "progress",
-                            "phase": f"Overwrite (Pass {i+1}/{passes})",
-                            "percentage": round(percentage, 2),
-                            "speed": f"{format_size(smoothed_speed)}/s",
-                            "eta": eta_display
-                        }
-                        print(json.dumps(progress_data), flush=True)
-
-    except (IOError, OSError, PermissionError) as e:
-        status_update("status", f"Warning: Could not overwrite {file_path}. Reason: {e}")
-    
-    return processed_bytes
-
-def fill_free_space_and_report(target_path, start_time, total_work, processed_bytes, speed_tracker):
-    """Fills free space and reports progress.
-    Returns (junk_file_paths, target_path, created_count) where created_count counts
-    only successfully written files; junk_file_paths includes any partially created
-    files for cleanup.
-    """
-    junk_file_paths = []
-    
-    status_update("status", f"Starting free space fill phase in: {target_path}")
-    
-    # Check free space before starting
-    try:
-        _, _, free_space = shutil.disk_usage(target_path)
-        status_update("status", f"Available free space: {format_size(free_space)}")
-        if free_space < 1024 * 1024:  # Less than 1MB
-            status_update("status", "Very little free space available, skipping fill phase")
-            return [], target_path, 0
-    except Exception as e:
-        status_update("status", f"Could not check free space: {e}")
-    
-    status_update("status", f"Creating temp files directly in: {target_path}")
-    
-    try:
-        count = 0  # number of successfully written files
-        status_update("status", "Starting temp file creation to fill free space...")
-        
-        while not is_cancelled:
-            file_index = count  # next file index to try creating
-            junk_file_path = os.path.join(target_path, f'junk_fill_{file_index}.tmp')
-            
-            try:
-                chunk_size = 1024 * 1024 * 32 # 32MB chunks
-                # Pre-generate random data
-                random_data = secrets.token_bytes(chunk_size)
-                
-                # Measure only actual write operation time
-                chunk_start_time = time.perf_counter()
-                with open(junk_file_path, 'wb') as f:
-                    # Append to cleanup list once file handle is opened (file now exists)
-                    junk_file_paths.append(junk_file_path)
-                    f.write(random_data)
-                    f.flush()  # Force write to disk
-                chunk_duration = time.perf_counter() - chunk_start_time
-                processed_bytes += chunk_size
-                count += 1  # success
-                
-                # Log every 10 files created (use zero-based index for message parity)
-                if (count - 1) % 10 == 0:
-                    status_update("status", f"Created temp file #{count - 1}: {format_size(chunk_size)} - Total: {format_size(processed_bytes)}")
-
-                # --- Improved Progress Calculation & Reporting ---
-                elapsed_time = time.time() - start_time
-                
-                # Update speed tracker (only for meaningful measurements)
-                if chunk_duration > 0.01:  # Ignore very fast chunks (likely cached)
-                    current_speed = chunk_size / chunk_duration
-                    speed_tracker.append(current_speed)
-                    if len(speed_tracker) > 20:
-                        speed_tracker.pop(0)
-                
-                # For free space filling, estimate ETA based on remaining free space and smoothed speed
-                if len(speed_tracker) >= 5 and elapsed_time > 5:  # Need sufficient samples
-                    sorted_speeds = sorted(speed_tracker)
-                    mid = len(sorted_speeds) // 2
-                    if len(sorted_speeds) % 2 == 0:
-                        smoothed_speed = (sorted_speeds[mid-1] + sorted_speeds[mid]) / 2
-                    else:
-                        smoothed_speed = sorted_speeds[mid]
-                    # Estimate remaining free space
-                    try:
-                        _, _, free = shutil.disk_usage(target_path)
-                        remaining_work = free
-                        eta = remaining_work / smoothed_speed if smoothed_speed > 0 else float('inf')
-                        eta_display = format_eta(eta) if eta != float('inf') else "Calculating..."
-                    except Exception:
-                        eta_display = "Calculating..."
-                else:
-                    smoothed_speed = processed_bytes / elapsed_time if elapsed_time > 0 else 0
-                    eta_display = "Calculating..."
-                # Cap percentage to prevent going over 100%
-                percentage = min((processed_bytes / total_work) * 100 if total_work > 0 else 100, 99.9)
-                # Report progress less frequently to reduce spam
-                if count % 5 == 0 or (time.time() - getattr(fill_free_space_and_report, 'last_report_time', 0) > 3):
-                    fill_free_space_and_report.last_report_time = time.time()
-                    progress_data = {
-                        "type": "progress",
-                        "phase": "Fill Free Space",
-                        "percentage": round(percentage, 2),
-                        "speed": f"{format_size(smoothed_speed)}/s",
-                        "eta": eta_display
-                    }
-                    print(json.dumps(progress_data), flush=True)
-            except (IOError, OSError) as e:
-                # Disk is likely full or write error
-                # Only add to cleanup if file was already added during successful open
-                # (the file gets added to junk_file_paths when we open it successfully)
-                status_update("status", f"Disk full or write error after {count} temp files: {e}")
-                break
-        
-        # Use 'count' (successful writes) for creation summary, not total tracked files
-        # chunk_size defined in loop; if loop never ran, default to 0
-        try:
-            total_written_size = count * chunk_size
-        except UnboundLocalError:
-            total_written_size = 0
-        status_update("status", f"Free space fill completed. Created {count} temp files totaling {format_size(total_written_size)}")
-        # After filling, return the list of temp files, the target path, and the successful count
-        return junk_file_paths, target_path, count
-    except (IOError, OSError) as e:
-        status_update("status", f"Disk space is full. Stopping junk file creation. Error: {e}")
-        # Return what we have so far; zero successful files if we didn't track count
-        return junk_file_paths, target_path, 0
-
-def main():
-    parser = argparse.ArgumentParser(description="Securely wipe a directory.")
-    parser.add_argument('-p', '--path', required=True, help="The absolute path to the directory to wipe.")
-    parser.add_argument('-m', '--mode', required=True, choices=['quick', 'secure', 'paranoid'], help="The wiping mode.")
-    args = parser.parse_args()
-
-    if not os.path.exists(args.path):
-        status_update("error", f"Target path does not exist: {args.path}")
-        sys.exit(1)
-    
-    if not os.access(args.path, os.R_OK):
-        status_update("error", f"No read permission for target path: {args.path}")
-        if os.name == 'posix':  # Linux/Unix
-            status_update("status", "Try running with sudo: sudo python3 main.py ...")
-            if args.path.startswith('/mnt/') or args.path.startswith('/media/'):
-                status_update("status", "For mounted drives, you may need to remount with user permissions")
-        else:  # Windows
-            status_update("status", "Try running as Administrator")
-        sys.exit(1)
-    
-    # Additional check for mounted drives on Linux
-    if os.name == 'posix' and (args.path.startswith('/mnt/') or args.path.startswith('/media/')):
-        try:
-            # Try to create a test file to verify write permissions
-            test_file = os.path.join(args.path, '.permission_test_temp')
-            with open(test_file, 'w') as f:
-                f.write('test')
-            os.remove(test_file)
-        except (OSError, PermissionError):
-            status_update("error", f"No write permission for mounted drive: {args.path}")
-            status_update("status", "Mounted Windows drives may require special mount options for write access")
-            status_update("status", "Try: sudo mount -o remount,uid=$(id -u),gid=$(id -g) {mount_point}")
+def ensure_privileges_or_exit(dry_run=False):
+    """Exit the script if required administrative privileges are not met."""
+    if dry_run:
+        status_update("status", "Dry run: Skipping privilege checks.")
+        return
+    if os.name == 'nt':
+        if not is_admin_windows():
+            status_update("error", "Administrator privileges are required for destructive operations on Windows.")
+            sys.exit(1)
+    else:
+        if not is_root_linux():
+            status_update("error", "Root privileges are required for destructive operations on Linux.")
             sys.exit(1)
 
-    junk_files_created = []
-    temp_location = None
+def sanitize_fs_type(fs_type: str):
+    """
+    Restricts filesystem types to a safe whitelist to prevent command injection.
+    Returns the sanitized type or None if it's not allowed.
+    """
+    if not fs_type:
+        return None
+
+    normalized = fs_type.strip().upper()
+    if os.name == 'nt':
+        allowed = {"NTFS", "FAT32", "EXFAT"}
+        return normalized if normalized in allowed else None
+    else: # Linux and other POSIX
+        allowed = {"EXT4", "EXT3", "EXT2", "XFS", "BTRFS", "NTFS", "VFAT", "EXFAT"}
+        # mkfs tools are typically lowercase, e.g., 'mkfs.ext4'
+        return fs_type.strip().lower() if normalized in allowed else None
+
+
+# --- Frontend Communication Helpers ---
+def status_update(msg_type, message):
+    """Sends a JSON formatted status message to stdout for the frontend."""
+    print(json.dumps({"type": msg_type, "message": message}), flush=True)
+
+def progress_update(phase, percentage=None, bar=None):
+    """Sends a JSON formatted progress message to stdout."""
+    data = {"type": "progress", "phase": phase}
+    if percentage is not None:
+        data["percentage"] = round(percentage, 1)
+    if bar is not None:
+        data["bar"] = bar
+    print(json.dumps(data), flush=True)
+
+
+# --- Drive Enumeration ---
+def list_connected_drives():
+    """Enumerate connected drives across platforms and return a list of dicts."""
+    if os.name == 'nt':
+        return _list_drives_windows()
+    else:
+        return _list_drives_posix()
+
+def _list_drives_windows():
+    drives = []
+    kernel32 = ctypes.windll.kernel32
+    GetLogicalDrives = kernel32.GetLogicalDrives
+    GetDriveTypeW = kernel32.GetDriveTypeW
+    GetVolumeInformationW = kernel32.GetVolumeInformationW
+    GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    GetDriveTypeW.restype = wintypes.UINT
+    mask = GetLogicalDrives()
+    system_drive = os.environ.get('SystemDrive', 'C:').upper()
+    DRIVE_TYPES = {
+        0: 'unknown', 1: 'no_root_dir', 2: 'removable', 3: 'fixed', 4: 'remote', 5: 'cdrom', 6: 'ramdisk'
+    }
+
+    for i in range(26):
+        if not (mask & (1 << i)):
+            continue
+        letter = chr(ord('A') + i)
+        root = f"{letter}:\\"
+        try:
+            dtype = DRIVE_TYPES.get(GetDriveTypeW(ctypes.c_wchar_p(root)), 'unknown')
+            is_removable = dtype == 'removable'
+            is_system = (f"{letter}:".upper() == system_drive.upper())
+            fs_name_buf = ctypes.create_unicode_buffer(255)
+            vol_name_buf = ctypes.create_unicode_buffer(255)
+            serial = wintypes.DWORD()
+            max_comp = wintypes.DWORD()
+            fs_flags = wintypes.DWORD()
+            try:
+                GetVolumeInformationW(ctypes.c_wchar_p(root), vol_name_buf, 255, ctypes.byref(serial), ctypes.byref(max_comp), ctypes.byref(fs_flags), fs_name_buf, 255)
+                fstype = fs_name_buf.value or None
+                label = vol_name_buf.value or None
+            except Exception:
+                fstype = None
+                label = None
+            try:
+                total, used, free = shutil.disk_usage(root)
+            except Exception:
+                total = used = free = None
+            drives.append({
+                'path': root,
+                'device': f"\\\\.\\{letter}:",
+                'type': dtype,
+                'fstype': fstype,
+                'label': label,
+                'total': total,
+                'used': used,
+                'free': free,
+                'is_system': is_system,
+                'is_removable': is_removable
+            })
+        except Exception:
+            # Skip problematic drive letters
+            continue
+    return drives
+
+def _list_drives_posix():
+    drives = []
+    mounts_file = '/proc/mounts'
+    ignore_fs = {'proc','sysfs','devtmpfs','devpts','tmpfs','cgroup','cgroup2','overlay','squashfs','ramfs','securityfs','pstore','autofs','debugfs','tracefs','fusectl'}
+    seen_devices = set()
+    try:
+        with open(mounts_file, 'r') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                device, mountpoint, fstype = parts[0], parts[1], parts[2]
+                if not device.startswith('/dev/'):
+                    continue
+                if fstype in ignore_fs:
+                    continue
+                if device in seen_devices:
+                    continue
+                seen_devices.add(device)
+                try:
+                    total, used, free = shutil.disk_usage(mountpoint)
+                except Exception:
+                    total = used = free = None
+                # Heuristic removable detection via /sys/block/<dev>/removable
+                is_removable = False
+                try:
+                    base = os.path.basename(device)
+                    # handle partitions like sdb1 -> sdb
+                    block = ''.join([c for c in base if not c.isdigit()])
+                    removable_path = f"/sys/block/{block}/removable"
+                    if os.path.exists(removable_path):
+                        with open(removable_path, 'r') as rf:
+                            is_removable = rf.read().strip() == '1'
+                except Exception:
+                    pass
+                drives.append({
+                    'path': mountpoint,
+                    'device': device,
+                    'type': 'block',
+                    'fstype': fstype,
+                    'label': None,
+                    'total': total,
+                    'used': used,
+                    'free': free,
+                    'is_system': mountpoint == '/',
+                    'is_removable': is_removable
+                })
+    except FileNotFoundError:
+        # Fallback: use df -T
+        try:
+            proc = subprocess.run(['df','-T'], check=True, capture_output=True, text=True)
+            lines = proc.stdout.splitlines()[1:]
+            for line in lines:
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+                device, fstype, total_k, used_k, avail_k, percent, mountpoint = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]
+                if not device.startswith('/dev/'):
+                    continue
+                if fstype in ignore_fs:
+                    continue
+                total = int(total_k) * 1024
+                used = int(used_k) * 1024
+                free = int(avail_k) * 1024
+                drives.append({
+                    'path': mountpoint,
+                    'device': device,
+                    'type': 'block',
+                    'fstype': fstype,
+                    'label': None,
+                    'total': total,
+                    'used': used,
+                    'free': free,
+                    'is_system': mountpoint == '/',
+                    'is_removable': False
+                })
+        except Exception:
+            pass
+    return drives
+
+
+# --- Core Wiping & Formatting Logic ---
+
+def legacy_fast_wipe(target_path, fs_type):
+    """
+    Fast wipe: Destroys filesystem metadata at the start of the partition
+    and then performs a quick format.
+    """
+    if os.name == 'nt':
+        return _fast_wipe_windows(target_path, fs_type)
+    else:
+        return _fast_wipe_linux(target_path, fs_type)
+
+def _fast_wipe_windows(target_path, fs_type):
+    """Windows implementation of the fast wipe using ctypes."""
+    drive_letter = os.path.splitdrive(target_path)[0]
+    if not drive_letter:
+        status_update("error", f"Invalid path for Windows wipe: {target_path}")
+        return False
+    
+    volume_path = f"\\\\.\\{drive_letter}"
+    h_volume = None
 
     try:
-        if args.mode == 'quick':
-            # Quick mode does not get an ETA as it's just deleting files.
-            status_update("status", "Mode: Quick Wipe (File Deletion Only)")
-            # Re-implement quick delete logic here for simplicity
-            files_deleted = 0
-            dirs_deleted = 0
-            errors_encountered = 0
-            
-            for root, dirs, files in os.walk(args.path, topdown=False):
-                # Skip system directories
-                dirs[:] = [d for d in dirs if not is_system_directory(os.path.join(root, d))]
-                
-                # Delete files first
-                for name in files:
-                    file_path = os.path.join(root, name)
-                    try:
-                        if os.access(file_path, os.W_OK):
-                            os.remove(file_path)
-                            files_deleted += 1
-                        else:
-                            status_update("status", f"Skipping protected file: {file_path}")
-                            errors_encountered += 1
-                    except (OSError, PermissionError) as e:
-                        status_update("status", f"Could not delete file {file_path}: {e}")
-                        errors_encountered += 1
-                
-                # Then delete directories (they should be empty now)
-                for name in dirs:
-                    dir_path = os.path.join(root, name)
-                    try:
-                        if os.access(dir_path, os.W_OK):
-                            os.rmdir(dir_path)
-                            dirs_deleted += 1
-                        else:
-                            status_update("status", f"Skipping protected directory: {dir_path}")
-                            errors_encountered += 1
-                    except (OSError, PermissionError) as e:
-                        status_update("status", f"Could not delete directory {dir_path}: {e}")
-                        errors_encountered += 1
-            
-            # Final sweep to ensure no leftovers (handles read-only and nested cases)
-            fs_files, fs_dirs = final_sweep_delete_everything(args.path)
-            files_deleted += fs_files
-            dirs_deleted += fs_dirs
-
-            status_update("status", f"Quick wipe completed: {files_deleted} files and {dirs_deleted} directories deleted")
-            if errors_encountered > 0:
-                status_update("status", f"Note: {errors_encountered} items could not be deleted due to permissions")
-            
-            # No temp files created in quick mode
-            junk_files_created = []
-            temp_location = None
-
-        else: # secure or paranoid
-            passes = 3 if args.mode == 'paranoid' else 1
-            total_work, file_paths = phase_0_calculate_work(args.path, passes)
-            
-            processed_bytes = 0
-            start_time = time.time()
-            speed_tracker = []  # Track recent speed measurements for smoothing
-
-            # --- Phase 1: Overwrite ---
-            for file_path in file_paths:
-                if is_cancelled: break
-                processed_bytes = overwrite_and_report(file_path, passes, start_time, total_work, processed_bytes, speed_tracker)
-            
-            # --- Phase 2: Delete Files and Folders ---
-            if not is_cancelled:
-                status_update("status", "Deleting overwritten files...")
-                for file_path in file_paths:
-                    try: os.remove(file_path)
-                    except OSError: pass
-                
-                status_update("status", "Deleting empty directories...")
-                # Delete all directories (including nested ones) - multiple passes to handle nested structure
-                deleted_dirs = 0
-                max_attempts = 5  # Prevent infinite loop
-                attempt = 0
-                
-                while attempt < max_attempts:
-                    attempt += 1
-                    dirs_deleted_this_pass = 0
-                    
-                    # Walk through all directories bottom-up
-                    for root, dirs, files in os.walk(args.path, topdown=False):
-                        # Skip system directories
-                        dirs[:] = [d for d in dirs if not is_system_directory(os.path.join(root, d))]
-                        
-                        for d in dirs:
-                            dir_path = os.path.join(root, d)
-                            try:
-                                # Try to delete directory (will only work if empty)
-                                os.rmdir(dir_path)
-                                dirs_deleted_this_pass += 1
-                                deleted_dirs += 1
-                            except OSError:
-                                # Directory not empty or permission denied
-                                pass
-                    
-                    # If no directories were deleted in this pass, we're done
-                    if dirs_deleted_this_pass == 0:
-                        break
-                
-                # Final sweep to ensure no leftovers (handles read-only and nested cases)
-                fs_files, fs_dirs = final_sweep_delete_everything(args.path)
-                deleted_dirs += fs_dirs
-                status_update("status", f"Deleted {deleted_dirs} directories (final sweep removed {fs_dirs} more; {fs_files} stray files removed)")
-
-            # --- Phase 3: Fill Free Space ---
-            if not is_cancelled:
-                status_update("status", "Phase 3: Starting free space fill phase...")
-                junk_files_created, temp_location, created_count = fill_free_space_and_report(args.path, start_time, total_work, processed_bytes, speed_tracker)
-                status_update("status", f"Phase 3 completed. {created_count} temp files created.")
+        # Define necessary Windows constants and function prototypes
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        FSCTL_LOCK_VOLUME = 0x00090018
+        FSCTL_DISMOUNT_VOLUME = 0x00090020
+        FSCTL_UNLOCK_VOLUME = 0x0009001C
         
-        # --- Phase 4: Cleanup ---
-        status_update("status", f"Cleaning up {len(junk_files_created)} temporary files...")
-        deleted_count = 0
-        for f in junk_files_created:
-            try: 
-                os.remove(f)
-                deleted_count += 1
-            except OSError as e:
-                status_update("status", f"Could not delete temp file {f}: {e}")
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
         
-        status_update("status", f"Deleted {deleted_count} out of {len(junk_files_created)} temp files")
+        # 1. Get a handle to the volume
+        h_volume = kernel32.CreateFileW(
+            ctypes.c_wchar_p(volume_path),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None
+        )
+        
+        if h_volume == wintypes.HANDLE(-1).value:
+            status_update("error", f"Failed to get handle for {volume_path}. Error code: {ctypes.get_last_error()}")
+            return False
 
-        if is_cancelled:
-            sys.exit(130)
-        else:
-            status_update("status", "All operations completed.")
+        # 2. Lock and dismount the volume for exclusive access
+        progress_update(f"Locking and dismounting {drive_letter}...")
+        bytes_returned = wintypes.DWORD()
+        if not kernel32.DeviceIoControl(h_volume, FSCTL_LOCK_VOLUME, None, 0, None, 0, ctypes.byref(bytes_returned), None):
+            status_update("error", f"Failed to lock volume. It may be in use. Error code: {ctypes.get_last_error()}")
+            return False
+        if not kernel32.DeviceIoControl(h_volume, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, ctypes.byref(bytes_returned), None):
+            status_update("warning", f"Failed to dismount volume, but continuing. Error code: {ctypes.get_last_error()}")
 
-    except PermissionError as e:
-        status_update("error", f"Permission denied: {e}")
-        status_update("status", "This typically happens when trying to access system files.")
-        status_update("status", "Try running with elevated permissions or choose a different target path.")
-        # Still try to clean up
-        for f in junk_files_created:
-            try: os.remove(f)
-            except OSError: pass
-        sys.exit(1)
+        # 3. Overwrite the first 512MB of the partition to destroy metadata
+        progress_update(f"Destroying filesystem metadata on {drive_letter}...", 0)
+        chunk_size = 1024 * 1024  # 1MB
+        total_chunks = 512
+        bytes_written = wintypes.DWORD(0)
+        for i in range(total_chunks):
+            if is_cancelled: return False
+            random_data = os.urandom(chunk_size)
+            if not kernel32.WriteFile(h_volume, random_data, chunk_size, ctypes.byref(bytes_written), None):
+                status_update("error", f"Failed to write to volume. Error code: {ctypes.get_last_error()}")
+                return False
+            
+            percentage = ((i + 1) / total_chunks) * 100
+            bar_len = int(percentage / 2)
+            progress_update(
+                f"Destroying metadata on {drive_letter}...", percentage,
+                "█" * bar_len + "-" * (50 - bar_len)
+            )
+        status_update("status", "Filesystem metadata successfully destroyed.")
+    
+    finally:
+        # 4. ALWAYS unlock and close the handle, even if errors occurred
+        if h_volume and h_volume != wintypes.HANDLE(-1).value:
+            kernel32.DeviceIoControl(h_volume, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, ctypes.byref(wintypes.DWORD()), None)
+            kernel32.CloseHandle(h_volume)
+
+    # 5. Perform a quick format to create a new, clean filesystem
+    return _windows_format(drive_letter, fs_type, quick=True, label="WIPED")
+
+def _fast_wipe_linux(target_path, fs_type):
+    """Linux implementation of the fast wipe using dd and mkfs."""
+    # 1. Unmount the device. It might fail if already unmounted, so we don't check the result.
+    progress_update(f"Unmounting {target_path}...")
+    subprocess.run(['umount', target_path], check=False, capture_output=True)
+
+    # 2. Overwrite the partition header with dd to destroy metadata
+    progress_update(f"Destroying filesystem metadata on {target_path}...")
+    dd_command = ['dd', 'if=/dev/zero', f'of={target_path}', 'bs=1M', 'count=512']
+    try:
+        subprocess.run(dd_command, check=True, capture_output=True)
+        status_update("status", "Filesystem metadata successfully destroyed.")
+    except subprocess.CalledProcessError as e:
+        status_update("error", f"Failed to overwrite partition header with dd: {e.stderr.decode('utf-8', errors='ignore')}")
+        return False
+    except FileNotFoundError:
+        status_update("error", "The 'dd' command was not found. Please ensure it is installed.")
+        return False
+
+    # 3. Create a new filesystem
+    progress_update(f"Creating new {fs_type} filesystem...")
+    return _linux_mkfs(target_path, fs_type, label="WIPED", force=True)
+
+def paranoid_wipe(target_path, passes, fs_type):
+    """
+    Performs a full, multi-pass overwrite of the entire partition using OS-native tools.
+    WARNING: This is extremely slow.
+    """
+    is_windows = os.name == 'nt'
+    if is_windows:
+        drive_letter = os.path.splitdrive(target_path)[0]
+        progress_update(f"Starting PARANOID wipe of {drive_letter} ({passes} passes)... This may take many hours.")
+        command = f'format {drive_letter} /FS:{fs_type} /V:WIPED /Y /P:{passes}'
+    else: # Linux
+        progress_update(f"Starting PARANOID wipe of {target_path} with shred... This may take many hours.")
+        # Unmount first to ensure exclusive access
+        subprocess.run(['umount', target_path], check=False, capture_output=True)
+        command = f"shred -v -n {passes} {target_path}"
+
+    try:
+        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while proc.poll() is None:
+            if is_cancelled:
+                proc.terminate() # Send SIGTERM to the process
+                status_update("status", "Termination signal sent to wipe process.")
+                return False
+            time.sleep(2)
+        
+        if proc.returncode != 0:
+            status_update("error", f"Wipe/Format process failed with code {proc.returncode}.")
+            status_update("error", f"Details: {proc.stderr.read()}")
+            return False
+            
+        # On Linux, shred only overwrites, it doesn't create a filesystem. We must do that now.
+        if not is_windows:
+            progress_update(f"Creating new {fs_type} filesystem...")
+            if not _linux_mkfs(target_path, fs_type, label="WIPED", force=True):
+                return False
+        return True
     except Exception as e:
-        status_update("error", f"An unexpected error occurred: {e}")
-        # Still try to clean up
-        for f in junk_files_created:
-            try: os.remove(f)
-            except OSError: pass
+        status_update("error", f"An unexpected error occurred during the wipe process: {e}")
+        return False
+
+
+# --- Multi-Stage Secure Workflow ---
+
+def _windows_format(drive_letter, fs_type, quick=False, label="WIPED", dry_run=False):
+    """Helper to call the Windows format command."""
+    flags = [f'/FS:{fs_type}', f'/V:{label}', '/Y']
+    if quick:
+        flags.append('/Q')
+    command = f"format {drive_letter} {' '.join(flags)}"
+    
+    if dry_run:
+        status_update("status", f"[DRY-RUN] Would run: {command}")
+        return True
+    try:
+        subprocess.run(command, shell=True, check=True, capture_output=True)
+        status_update("status", f"Format completed ({'quick' if quick else 'full'}) on {drive_letter}.")
+        return True
+    except subprocess.CalledProcessError as e:
+        status_update("error", f"Format failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        return False
+
+def _linux_mkfs(device_path, fs_type, label="WIPED", force=True, dry_run=False):
+    """Helper to call the Linux mkfs command."""
+    cmd = [f'mkfs.{fs_type}', '-L', label]
+    # The -F (force) flag is not supported by mkfs.ntfs
+    if force and 'ntfs' not in fs_type:
+        cmd.append('-F')
+    cmd.append(device_path)
+    
+    if dry_run:
+        status_update("status", f"[DRY-RUN] Would run: {' '.join(cmd)}")
+        return True
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        status_update("status", f"Filesystem '{fs_type}' created on {device_path}.")
+        return True
+    except subprocess.CalledProcessError as e:
+        status_update("error", f"mkfs failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        return False
+    except FileNotFoundError:
+        status_update("error", f"mkfs tool for '{fs_type}' not found. Please ensure the relevant filesystem utilities are installed.")
+        return False
+
+def _fill_with_temp_files(root_path, dry_run=False):
+    """Fills all free space on a mounted path with temporary files of random data."""
+    if dry_run:
+        status_update("status", f"[DRY-RUN] Would fill free space on {root_path} with temp files.")
+        return True
+        
+    folder = os.path.join(root_path, 'SCRUB_FILL')
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        status_update("error", f"Cannot create temp folder '{folder}': {e}")
+        return False
+
+    min_free_mb = 50
+    chunk_size_mb = 64
+    chunk_size = chunk_size_mb * 1024 * 1024
+    min_free_bytes = min_free_mb * 1024 * 1024
+    file_index = 0
+
+    try:
+        while True:
+            if is_cancelled:
+                status_update("status", "Cancellation requested during fill stage.")
+                return False
+
+            total, used, free = shutil.disk_usage(root_path)
+            if free <= min_free_bytes:
+                status_update("status", "Disk fill appears complete.")
+                break
+
+            file_index += 1
+            filename = os.path.join(folder, f"FILL_{file_index:04d}.bin")
+            
+            # IMPROVEMENT: Use a smaller, more frequent progress update chunk size
+            progress_chunk = 16 * 1024 * 1024 # 16MB for reporting
+            last_reported_written = 0
+            
+            try:
+                with open(filename, 'wb') as f:
+                    while True:
+                        if is_cancelled: return False
+                        current_free = shutil.disk_usage(root_path).free
+                        if current_free <= min_free_bytes:
+                            break
+                        
+                        to_write = min(chunk_size, current_free - min_free_bytes)
+                        if to_write <= 0: break
+                        
+                        f.write(os.urandom(to_write))
+                        last_reported_written += to_write
+                        
+                        # Update progress bar more frequently
+                        if last_reported_written >= progress_chunk:
+                            percent_used = ((total - current_free) / total) * 100
+                            bar_len = int(percent_used / 2)
+                            progress_update("Filling free space", percent_used, "█" * bar_len + "-" * (50 - bar_len))
+                            last_reported_written = 0
+            
+            # FIX: Add specific error handling for out of space condition
+            except OSError as e:
+                if e.errno == 28: # No space left on device
+                    status_update("status", "Disk fill complete (hit storage limit).")
+                    break
+                else:
+                    raise # Re-raise other OSErrors
+                    
+    except Exception as e:
+        status_update("error", f"Error while filling disk: {e}")
+        return False
+    finally:
+        # Clean up the large temp files regardless of success or failure
+        if os.path.exists(folder):
+            status_update("status", "Removing temporary fill files...")
+            shutil.rmtree(folder, ignore_errors=True)
+
+    return True
+
+def secure_wipe(target_path, fs_type, dry_run=False):
+    """
+    Executes a 4-stage secure wipe:
+    1. Full format to create a clean filesystem and map out bad sectors.
+    2. Quick reformat to refresh metadata.
+    3. Fill all available space with random data files.
+    4. Final quick format to leave a clean, empty filesystem.
+    """
+    is_windows = os.name == 'nt'
+    if is_windows:
+        drive_letter = os.path.splitdrive(target_path)[0]
+        if not drive_letter:
+            status_update("error", "Invalid Windows drive path supplied.")
+            return False
+        # Safety Check: Never operate on the system drive.
+        system_drive = os.environ.get('SystemDrive', 'C:')
+        if drive_letter.upper() == system_drive.upper():
+            status_update("error", "CRITICAL: Refusing to operate on the system drive.")
+            return False
+        
+        root_path = drive_letter + '\\'
+        
+        progress_update("Step 1/4: Full format (may take time)...")
+        if not _windows_format(drive_letter, fs_type, quick=False, label="WIPED1", dry_run=dry_run): return False
+        if is_cancelled: return False
+        
+        progress_update("Step 2/4: Quick reformat...")
+        if not _windows_format(drive_letter, fs_type, quick=True, label="WIPED2", dry_run=dry_run): return False
+        if is_cancelled: return False
+        
+        progress_update("Step 3/4: Filling free space with random data...")
+        if not _fill_with_temp_files(root_path, dry_run=dry_run): return False
+        if is_cancelled: return False
+        
+        progress_update("Step 4/4: Final quick format...")
+        if not _windows_format(drive_letter, fs_type, quick=True, label="CLEAN", dry_run=dry_run): return False
+        
+        return True
+    else: # Linux
+        device = target_path
+        mount_point = f"/mnt/datascrubber_{int(time.time())}"
+        
+        try:
+            progress_update("Step 1/4: Creating initial filesystem...")
+            if not _linux_mkfs(device, fs_type, label='WIPED1', dry_run=dry_run): return False
+            if is_cancelled: return False
+            
+            progress_update("Step 2/4: Re-creating filesystem...")
+            if not _linux_mkfs(device, fs_type, label='WIPED2', dry_run=dry_run): return False
+            if is_cancelled: return False
+            
+            # Mount the device to fill it with files
+            if not dry_run:
+                os.makedirs(mount_point, exist_ok=True)
+                subprocess.run(['mount', device, mount_point], check=True, capture_output=True)
+            
+            progress_update("Step 3/4: Filling free space with random data...")
+            if not _fill_with_temp_files(mount_point if not dry_run else '/dev/null', dry_run=dry_run): return False
+            if is_cancelled: return False
+
+        except subprocess.CalledProcessError as e:
+            status_update("error", f"Failed to mount device: {e.stderr.decode('utf-8', errors='ignore')}")
+            return False
+        finally:
+            # FIX: Ensure cleanup happens even on cancellation or error
+            if not dry_run and os.path.ismount(mount_point):
+                status_update("status", f"Unmounting {mount_point}...")
+                subprocess.run(['umount', mount_point], check=False, capture_output=True)
+            if not dry_run and os.path.exists(mount_point):
+                try:
+                    os.rmdir(mount_point)
+                except OSError:
+                    pass
+
+        progress_update("Step 4/4: Final format...")
+        if not _linux_mkfs(device, fs_type, label='CLEAN', dry_run=dry_run): return False
+        
+        return True
+
+
+# --- Main Execution Block ---
+def main():
+    """Parses arguments and orchestrates the wipe operation."""
+    parser = argparse.ArgumentParser(
+        description="Securely wipe a drive or partition.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument('-p', '--path', required=True, help="Drive root (e.g., D:\\) or block device (e.g., /dev/sdb1).")
+    parser.add_argument('-m', '--mode', required=True, choices=['secure', 'paranoid', 'legacy-fast'], help=
+        "secure: 4-stage format, fill, and reformat. Recommended.\n"
+        "paranoid: Slow multi-pass full disk overwrite (uses format /P or shred).\n"
+        "legacy-fast: Wipes the first 512MB and does a quick format."
+    )
+    parser.add_argument('-f', '--filesystem', required=True, help="Target filesystem (e.g., NTFS, ext4).")
+    # IMPROVEMENT: Add optional argument for number of passes in paranoid mode
+    parser.add_argument('--passes', type=int, default=3, help="[Paranoid Mode] Number of overwrite passes (default: 3).")
+    parser.add_argument('--dry-run', action='store_true', help="Show actions without executing them.")
+    parser.add_argument('--list-drives', action='store_true', help="List connected drives and exit.")
+    args = parser.parse_args()
+    
+    try:
+        if args.list_drives:
+            drives = list_connected_drives()
+            print(json.dumps({"type": "drives", "items": drives}, default=str), flush=True)
+            return
+
+        status_update("status", "Starting data wipe operation...")
+        ensure_privileges_or_exit(dry_run=args.dry_run)
+
+        # FIX: Validate filesystem type for all platforms early
+        sanitized_fs = sanitize_fs_type(args.filesystem)
+        if not sanitized_fs:
+            status_update("error", f"Unsupported or invalid filesystem type specified: '{args.filesystem}'")
+            sys.exit(1)
+
+        if args.dry_run:
+            status_update("status", "DRY-RUN ENABLED: No destructive actions will be performed.")
+
+        success = False
+        if args.mode == 'secure':
+            status_update("status", "Mode: Secure (4-step multi-stage wipe)")
+            success = secure_wipe(args.path, sanitized_fs, dry_run=args.dry_run)
+        elif args.mode == 'legacy-fast':
+            status_update("status", "Mode: Legacy Fast (metadata destroy + quick format)")
+            success = legacy_fast_wipe(args.path, sanitized_fs)
+        elif args.mode == 'paranoid':
+            status_update("status", f"Mode: Paranoid Wipe ({args.passes}-Pass Overwrite)")
+            status_update("warning", "This mode is extremely slow and may take many hours or days.")
+            success = paranoid_wipe(args.path, args.passes, sanitized_fs)
+
+        if not success:
+            if is_cancelled:
+                status_update("status", "Operation cancelled by user.")
+                sys.exit(130) # Standard exit code for cancellation
+            else:
+                status_update("error", "Wipe operation failed. Please review the logs.")
+                sys.exit(1)
+        
+        status_update("status", "All operations completed successfully.")
+
+    except Exception as e:
+        status_update("error", f"A critical and unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == '__main__':
